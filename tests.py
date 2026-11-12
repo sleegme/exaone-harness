@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import io
+import http.client
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -135,6 +139,7 @@ class SocketReplay:
         self.timeout = 2.0
         self.timeouts: list[float] = []
         self.shutdowns = 0
+        self.closed = False
 
     def settimeout(self, value: float) -> None:
         self.timeout = value
@@ -143,6 +148,9 @@ class SocketReplay:
     def shutdown(self, how: int) -> None:
         del how
         self.shutdowns += 1
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class HTTPReplay(io.BytesIO):
@@ -320,7 +328,7 @@ def exa_streaming_wire_budget() -> None:
 
     http = HTTPReplay(wire)
     with tempfile.TemporaryDirectory() as directory:
-        with patch("agent.urllib.request.urlopen", return_value=http) as open_http:
+        with patch("agent.urllib.request.OpenerDirector.open", return_value=http) as open_http:
             result = run_agent("task", Sandbox(Path(directory)), Executor(ExaClient("offline")),
                                GUIDE, budgets=Budgets(2, 64))
         body = json.loads(open_http.call_args.args[0].data)
@@ -346,7 +354,7 @@ def exa_streaming_wire_completion() -> None:
     ) + b"data: [DONE]\n\n"
     http = HTTPReplay(wire)
     with tempfile.TemporaryDirectory() as directory:
-        with patch("agent.urllib.request.urlopen", return_value=http):
+        with patch("agent.urllib.request.OpenerDirector.open", return_value=http):
             result = run_agent("task", Sandbox(Path(directory)), Executor(ExaClient("offline")),
                                GUIDE, budgets=Budgets(2, 4))
     assert result["status"] == "succeeded"
@@ -371,7 +379,7 @@ def raw_stream_deadline() -> None:
         terminal = b"data: " + json.dumps(delta({"content": "done"}, "stop")).encode() + b"\n\n"
         http = SlowHTTP(line * 10 + terminal)
         with tempfile.TemporaryDirectory() as directory:
-            with patch("agent.urllib.request.urlopen", return_value=http):
+            with patch("agent.urllib.request.OpenerDirector.open", return_value=http):
                 result = run_agent("task", Sandbox(Path(directory)), Executor(
                     ExaClient("offline"), RetryPolicy(2, 2),
                     clock=clock.read, sleep=clock.advance,
@@ -402,13 +410,13 @@ def silent_stream_remaining_timeout() -> None:
 
     http = SilentHTTP(b": heartbeat\n\n")
     with tempfile.TemporaryDirectory() as directory:
-        with patch("agent.urllib.request.urlopen", return_value=http):
+        with patch("agent.urllib.request.OpenerDirector.open", return_value=http):
             result = run_agent("task", Sandbox(Path(directory)), Executor(
                 ExaClient("offline"), RetryPolicy(2, 2),
                 clock=clock.read, sleep=clock.advance,
             ), GUIDE)
     assert clock.now == 2
-    assert http.socket.timeouts == [2, 1.5, 1.25]
+    assert http.socket.timeouts == [2, 2, 1.5, 1.25]
     assert http.closed
     assert result["failure"] == "retry_time_budget"
     assert result["final"] is None
@@ -435,7 +443,7 @@ def stream_timeouts_share_retry_budget() -> None:
         return http
 
     with tempfile.TemporaryDirectory() as directory:
-        with patch("agent.urllib.request.urlopen", side_effect=open_http):
+        with patch("agent.urllib.request.OpenerDirector.open", side_effect=open_http):
             result = run_agent("task", Sandbox(Path(directory)), Executor(
                 ExaClient("offline"), RetryPolicy(5, 2),
                 clock=clock.read, sleep=clock.advance,
@@ -477,7 +485,7 @@ def watchdog_interrupts_partial_line() -> None:
         def __next__(self) -> bytes:
             assert len(timers) == 1 and timers[0].started
             # No complete raw line is returned before the absolute alarm fires.
-            clock.advance(timers[0].interval)
+            clock.advance(timers[0].interval - clock.now)
             timers[0].action()
             assert self.socket.shutdowns == 1
             raise OSError("read interrupted by socket shutdown")
@@ -491,20 +499,113 @@ def watchdog_interrupts_partial_line() -> None:
         return http
 
     with tempfile.TemporaryDirectory() as directory:
-        with patch("agent.urllib.request.urlopen", side_effect=open_http):
+        with patch("agent.urllib.request.OpenerDirector.open", side_effect=open_http):
             with patch("agent.threading.Timer", TimerReplay):
                 result = run_agent("task", Sandbox(Path(directory)), Executor(
                     ExaClient("offline"), RetryPolicy(2, 10),
                     clock=clock.read, sleep=clock.advance,
                 ), GUIDE)
     assert clock.now == 2
-    assert timers[0].interval == 1.5
+    assert timers[0].interval == 2
     assert timers[0].cancelled and timers[0].joined
-    assert http.socket.timeouts == [1.5]
+    assert http.socket.timeouts == [1.5, 1.5]
     assert http.closed
     assert result["failure"] == "retry_time_budget"
     assert result["transport_attempts"][0]["error"] == "transport_timeout"
     assert result["final"] is None
+
+
+def localhost_request_deadline() -> None:
+    """Real urllib must interrupt slow headers as well as every body read phase."""
+    for mode in ("slow_headers", "silent_body", "partial_body", "heartbeat_body", "normal"):
+        stop, phase_started = threading.Event(), threading.Event()
+        errors: list[str] = []
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            server.settimeout(3)
+            address = server.getsockname()
+
+            def serve() -> None:
+                try:
+                    peer, _ = server.accept()
+                    with peer:
+                        peer.settimeout(3)
+                        request = b""
+                        while b"\r\n\r\n" not in request:
+                            block = peer.recv(8192)
+                            if not block:
+                                return
+                            request += block
+                        if mode == "slow_headers":
+                            peer.sendall(b"HTTP/1.1 200 OK\r\nX-Drip: ")
+                            phase_started.set()
+                            for _ in range(50):
+                                if stop.wait(0.02):
+                                    return
+                                peer.sendall(b"x")
+                            peer.sendall(b"\r\nContent-Length: 0\r\n\r\n")
+                        else:
+                            peer.sendall(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                            )
+                            phase_started.set()
+                            if mode == "normal":
+                                event = delta({"content": "done"}, "stop")
+                                peer.sendall(
+                                    b"data: " + json.dumps(event).encode() + b"\n\n"
+                                    b"data: [DONE]\n\n"
+                                )
+                            elif mode == "silent_body":
+                                stop.wait(2)
+                            else:
+                                while not stop.wait(0.02):
+                                    peer.sendall(
+                                        b": beat\n\n" if mode == "heartbeat_body" else b":x"
+                                    )
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # Expected when the deadline closes the client socket.
+                except (OSError, ValueError) as error:
+                    errors.append(str(error))
+
+            def resolve(host, port, *args, **kwargs):
+                del args, kwargs
+                assert host == "api.exaone.ai" and port == 443
+                return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)]
+
+            worker = threading.Thread(target=serve, daemon=True)
+            worker.start()
+            # Use real HTTPConnection, urllib and socket reads on loopback. TLS
+            # alone is bypassed; no DNS query or external connection is possible.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            budget = 2 if mode == "normal" else 0.15
+            try:
+                with tempfile.TemporaryDirectory() as directory:
+                    with patch("agent.socket.getaddrinfo", side_effect=resolve):
+                        with patch.object(
+                            http.client.HTTPSConnection, "connect", http.client.HTTPConnection.connect,
+                        ):
+                            with patch("agent.urllib.request._opener", opener):
+                                started = time.monotonic()
+                                result = run_agent("task", Sandbox(Path(directory)), Executor(
+                                    ExaClient("offline"), RetryPolicy(budget, budget, max_attempts=1),
+                                ), GUIDE)
+                                elapsed = time.monotonic() - started
+            finally:
+                stop.set()
+                worker.join(timeout=3)
+                assert not worker.is_alive()
+            assert phase_started.is_set(), (mode, errors)
+            assert not errors, (mode, errors)
+            if mode == "normal":
+                assert result["final"] == "done"
+                assert result["status"] == "succeeded"
+            else:
+                assert elapsed < 0.45, (mode, elapsed)
+                assert result["failure"] == "retry_time_budget", (mode, result["failure"])
+                assert result["transport_attempts"][0]["error"] == "transport_timeout"
+                assert result["final"] is None
+                assert len(result["transport_attempts"]) == 1
 
 
 def transport_retries() -> None:
@@ -760,6 +861,7 @@ def main() -> None:
         exa_streaming_wire_budget, exa_streaming_wire_completion,
         raw_stream_deadline, silent_stream_remaining_timeout, stream_timeouts_share_retry_budget,
         watchdog_interrupts_partial_line,
+        localhost_request_deadline,
         transport_retries, retry_budget_and_status,
         concurrency_limit, separate_times, sandbox_boundary, duplicate_guard,
         cli_end_to_end,

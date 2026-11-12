@@ -22,7 +22,10 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
 from pathlib import Path
+from ssl import SSLContext
+from types import TracebackType
 from typing import Callable, ContextManager, Iterable, Iterator, Protocol, TypeAlias, runtime_checkable
 
 JSON: TypeAlias = str | int | float | bool | None | list["JSON"] | dict[str, "JSON"]
@@ -185,6 +188,116 @@ def sse_events(lines: Iterable[bytes]) -> Iterator[Document]:
         raise ProtocolError("incomplete SSE event")
 
 
+class RequestDeadline:
+    """Own one alarm and the active socket before connect, headers and body."""
+
+    def __init__(self, deadline: float, clock: Callable[[], float]):
+        self.deadline, self.clock = deadline, clock
+        self.expired = threading.Event()
+        self.lock = threading.Lock()
+        self.socket: socket.socket | None = None
+        self.timer = threading.Timer(self.remaining(), self.expire)
+        self.timer.daemon = True
+
+    def remaining(self) -> float:
+        remaining = self.deadline - self.clock()
+        if self.expired.is_set() or remaining <= 0:
+            raise TransportTimeout()
+        return remaining
+
+    @staticmethod
+    def stop_socket(active: socket.socket) -> None:
+        try:
+            active.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # A not-yet-connected or concurrently closed socket is expected.
+        finally:
+            active.close()
+
+    def expire(self) -> None:
+        with self.lock:
+            self.expired.set()
+            active = self.socket
+        if active is not None:
+            self.stop_socket(active)
+
+    def attach(self, active: socket.socket) -> None:
+        with self.lock:
+            expired = self.expired.is_set() or self.clock() >= self.deadline
+            if not expired:
+                self.socket = active
+        if expired:
+            self.stop_socket(active)
+            raise TransportTimeout()
+        active.settimeout(self.remaining())
+
+    def create_connection(
+        self, address: tuple[str, int], timeout: float,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        """Publish each raw socket before connect; never restart the deadline."""
+        del timeout  # The absolute deadline owns every address attempt's timeout.
+        self.remaining()
+        failure: OSError | None = None
+        for family, kind, proto, _, target in socket.getaddrinfo(
+            *address, type=socket.SOCK_STREAM,
+        ):
+            active = socket.socket(family, kind, proto)
+            try:
+                self.attach(active)
+                if source_address is not None:
+                    active.bind(source_address)
+                active.connect(target)
+                self.attach(active)  # TLS inherits only time left after TCP connect.
+                return active
+            except OSError as error:
+                active.close()
+                self.remaining()
+                failure = error
+        if failure is not None:
+            raise failure
+        raise OSError("resolver returned no addresses")
+
+    def __enter__(self) -> RequestDeadline:
+        self.timer.start()
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None,
+        exc: BaseException | None, traceback: TracebackType | None,
+    ) -> None:
+        self.timer.cancel()
+        self.timer.join()
+        if self.socket is not None:
+            self.socket.close()
+
+
+class DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self, host: str, *, guard: RequestDeadline, timeout: float, context: SSLContext,
+    ):
+        super().__init__(host, timeout=timeout, context=context)
+        self.guard = guard
+        self._create_connection = guard.create_connection
+
+    def connect(self) -> None:
+        super().connect()
+        # TLS replaces/detaches the raw socket. Header reads must use its new owner.
+        self.guard.attach(self.sock)
+
+
+class DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, guard: RequestDeadline):
+        super().__init__()
+        self.guard = guard
+
+    def https_open(self, request: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(
+            partial(DeadlineHTTPSConnection, guard=self.guard),
+            request, context=self._context,
+        )
+
+
 class ExaClient:
     """Lazy SSE adapter; closing its context aborts the underlying HTTP request."""
 
@@ -208,55 +321,35 @@ class ExaClient:
                 "Accept": "text/event-stream",
             },
         )
-        expired = threading.Event()
-        try:
-            remaining = deadline - clock()
-            if remaining <= 0:
-                raise TransportTimeout()
-            with urllib.request.urlopen(request, timeout=min(timeout, remaining)) as response:
-                # urllib's HTTPResponse.fp is BufferedReader(SocketIO(socket)).
-                # Keep this stdlib-specific socket access inside the wire adapter.
-                transport_socket = response.fp.raw._sock
-
-                def expire() -> None:
-                    expired.set()
-                    try:
-                        transport_socket.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        # The response may have closed concurrently at the deadline.
-                        pass
-
-                remaining = deadline - clock()
-                if remaining <= 0:
-                    raise TransportTimeout()
-                # settimeout bounds silent reads. This watchdog also bounds a
-                # readline kept alive by bytes arriving without a newline.
-                timer = threading.Timer(remaining, expire)
-                timer.daemon = True
-                timer.start()
-                try:
+        with RequestDeadline(deadline, clock) as guard:
+            try:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}), DeadlineHTTPSHandler(guard),
+                )
+                with opener.open(request, timeout=min(timeout, guard.remaining())) as response:
+                    transport_socket = response.fp.raw._sock
+                    guard.attach(transport_socket)
                     yield sse_events(deadline_lines(
                         response, transport_socket.settimeout,
                         deadline=deadline, clock=clock,
                     ))
-                finally:
-                    timer.cancel()
-                    timer.join()
-        except urllib.error.HTTPError as error:
-            retry_after = error.headers.get("Retry-After")
-            status = error.code
-            error.close()
-            raise TransportError(status, retry_after) from None
-        except TimeoutError:
-            raise TransportTimeout() from None
-        except urllib.error.URLError as error:
-            if isinstance(error.reason, TimeoutError):
+            except urllib.error.HTTPError as error:
+                retry_after = error.headers.get("Retry-After")
+                status = error.code
+                error.close()
+                if guard.expired.is_set() or clock() >= deadline:
+                    raise TransportTimeout() from None
+                raise TransportError(status, retry_after) from None
+            except TimeoutError:
                 raise TransportTimeout() from None
-            raise TransportError(None) from None
-        except (OSError, http.client.HTTPException):
-            if expired.is_set() or clock() >= deadline:
-                raise TransportTimeout() from None
-            raise TransportError(None) from None
+            except urllib.error.URLError as error:
+                if isinstance(error.reason, TimeoutError) or guard.expired.is_set() or clock() >= deadline:
+                    raise TransportTimeout() from None
+                raise TransportError(None) from None
+            except (OSError, http.client.HTTPException):
+                if guard.expired.is_set() or clock() >= deadline:
+                    raise TransportTimeout() from None
+                raise TransportError(None) from None
 
 
 class ReplayClient:
