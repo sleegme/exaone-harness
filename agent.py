@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -17,10 +18,11 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Callable, Protocol, TypeAlias
+from typing import Callable, ContextManager, Iterable, Iterator, Protocol, TypeAlias, runtime_checkable
 
 JSON: TypeAlias = str | int | float | bool | None | list["JSON"] | dict[str, "JSON"]
 Document: TypeAlias = dict[str, JSON]
@@ -82,43 +84,101 @@ class Budgets:
                 "reasoning_max_tokens": self.reasoning_tokens,
                 "max_tokens": self.final_tokens,
             }
-        # The supplied EXAONE harness has no verified numeric reasoning-cap field.
+        # Streaming enforcement belongs to the executor, not an unverified API field.
         return {
             "max_tokens": self.reasoning_tokens + self.final_tokens,
             "reasoning_effort": "low",
-            "chat_template_kwargs": {"enable_thinking": True},
+            "chat_template_kwargs": {"enable_thinking": self.reasoning_tokens > 0},
         }
 
 
-class Client(Protocol):
+@dataclass(slots=True)
+class RunBudget:
+    """Reasoning is cumulative across turns and transport attempts in one run."""
+
+    limits: Budgets
+    reasoning_used: int = 0
+
+    @property
+    def remaining(self) -> Budgets:
+        return Budgets(
+            max(0, self.limits.reasoning_tokens - self.reasoning_used),
+            self.limits.final_tokens,
+        )
+
+
+def token_upper_bound(content: str) -> int:
+    """Conservative byte-token charge, independent of SSE chunk boundaries.
+
+    No provider tokenizer is available locally. Charging every UTF-8 byte avoids
+    the undercount of characters/4; these are budget units, not billed usage.
+    """
+    return len(content.encode("utf-8"))
+
+
+class CompletionClient(Protocol):
     separate_budgets: bool
 
     def complete(self, payload: Document, timeout: float) -> Document: ...
 
 
+@runtime_checkable
+class StreamingClient(Protocol):
+    separate_budgets: bool
+
+    def stream(self, payload: Document, timeout: float) -> ContextManager[Iterator[Document]]: ...
+
+
+Client: TypeAlias = CompletionClient | StreamingClient
+
+
+def sse_events(lines: Iterable[bytes]) -> Iterator[Document]:
+    """Decode lazily so a budget abort never drains the remaining HTTP stream."""
+    data: list[str] = []
+    for raw in lines:
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                event = "\n".join(data)
+                if event == "[DONE]":
+                    return
+                yield mapping(json.loads(event))
+                data.clear()
+        elif line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+    if data:
+        raise ProtocolError("incomplete SSE event")
+
+
 class ExaClient:
-    """OpenAI-compatible wire adapter; credentials are read only when selected."""
+    """Lazy SSE adapter; closing its context aborts the underlying HTTP request."""
 
     separate_budgets = False
 
     def __init__(self, key: str):
         self.key = key
 
-    def complete(self, payload: Document, timeout: float) -> Document:
+    @contextmanager
+    def stream(self, payload: Document, timeout: float) -> Iterator[Iterator[Document]]:
         request = urllib.request.Request(
             "https://api.exaone.ai/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"},
+            data=json.dumps({
+                **payload, "stream": True, "stream_options": {"include_usage": True},
+            }).encode(),
+            headers={
+                "Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return mapping(json.loads(response.read()))
+                yield sse_events(response)
         except urllib.error.HTTPError as error:
             retry_after = error.headers.get("Retry-After")
             status = error.code
             error.close()
             raise TransportError(status, retry_after) from None
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
             raise TransportError(None) from None
 
 
@@ -177,7 +237,83 @@ class Executor:
         self.attempts: list[Document] = []
         self.lock = threading.Lock()
 
-    def request(self, payload: Document, request_id: str) -> Document:
+    def streamed_response(
+        self, client: StreamingClient, payload: Document, timeout: float, budget: RunBudget,
+    ) -> Document:
+        """Accumulate deltas only while both independent budgets permit them."""
+        message: Document = {"role": "assistant", "content": "", "reasoning_content": ""}
+        tools: dict[int, Document] = {}
+        usage: Document = {}
+        finish = "stream_incomplete"
+        reasoning_start = budget.reasoning_used
+        answer_used = 0
+        deadline = self.clock() + timeout
+        with client.stream(payload, timeout) as events:
+            for event in events:
+                if self.clock() >= deadline:
+                    raise TransportError(None)
+                if event.get("usage") is not None:
+                    usage = mapping(event["usage"])
+                choices = event.get("choices") or []
+                if not isinstance(choices, list):
+                    raise ProtocolError("stream choices must be an array")
+                if not choices:
+                    continue
+                choice = mapping(choices[0])
+                delta = mapping(choice.get("delta") or {})
+                reasoning = text(delta.get("reasoning_content") or "")
+                content = text(delta.get("content") or "")
+                budget.reasoning_used += token_upper_bound(reasoning)
+                answer_used += token_upper_bound(content)
+                if budget.reasoning_used > budget.limits.reasoning_tokens:
+                    finish = "reasoning_budget_exceeded"
+                    break
+                if answer_used > budget.limits.final_tokens:
+                    finish = "final_budget_exceeded"
+                    break
+                if "role" in delta:
+                    message["role"] = text(delta["role"])
+                message["reasoning_content"] = text(message["reasoning_content"]) + reasoning
+                message["content"] = text(message["content"]) + content
+                calls = delta.get("tool_calls") or []
+                if not isinstance(calls, list):
+                    raise ProtocolError("stream tool_calls must be an array")
+                for raw_call in calls:
+                    call = mapping(raw_call)
+                    index = call.get("index")
+                    if not isinstance(index, int) or index < 0:
+                        raise ProtocolError("stream tool call requires nonnegative index")
+                    tool = tools.setdefault(index, {
+                        "id": "", "type": "function", "function": {"name": "", "arguments": ""},
+                    })
+                    if call.get("id") is not None:
+                        tool["id"] = text(tool["id"]) + text(call["id"])
+                    if call.get("function") is not None:
+                        function = mapping(call["function"])
+                        target = mapping(tool["function"])
+                        for key in ("name", "arguments"):
+                            if function.get(key) is not None:
+                                target[key] = text(target[key]) + text(function[key])
+                if choice.get("finish_reason") is not None:
+                    finish = text(choice["finish_reason"])
+        # The context has closed before this response can reach the agent loop.
+        if tools:
+            message["tool_calls"] = [tools[index] for index in sorted(tools)]
+        return {
+            "choices": [{"message": message, "finish_reason": finish}],
+            "usage": usage,
+            "budget_usage": {
+                "counting": "utf8_byte_upper_bound",
+                "reasoning": budget.reasoning_used - reasoning_start,
+                "answer": answer_used,
+                "reasoning_total": budget.reasoning_used,
+            },
+        }
+
+    def request(
+        self, payload: Document, request_id: str, *, budget: RunBudget | None = None,
+    ) -> Document:
+        run_budget = budget if budget is not None else RunBudget(Budgets())
         deadline = self.clock() + self.policy.budget_seconds
         if not self.limit.acquire(timeout=self.policy.budget_seconds):
             raise RequestFailed(request_id, "concurrency_wait_budget")
@@ -187,6 +323,7 @@ class Executor:
                 if remaining <= 0:
                     raise RequestFailed(request_id, "retry_time_budget")
                 started, start_wall = self.clock(), utc()
+                reasoning_before = run_budget.reasoning_used
                 record: Document = {
                     "request_id": request_id,
                     "attempt_id": f"{request_id}:{attempt}",
@@ -199,16 +336,27 @@ class Executor:
                 error: TransportError | None = None
                 response: Document | None = None
                 try:
-                    response = self.client.complete(
-                        payload, min(remaining, self.policy.timeout_seconds)
-                    )
+                    timeout = min(remaining, self.policy.timeout_seconds)
+                    if isinstance(self.client, StreamingClient):
+                        # Recompute after partial-stream retries too: consumed reasoning
+                        # is never refunded and exhausted runs cannot re-enable thinking.
+                        attempt_payload = {
+                            **payload, **run_budget.remaining.parameters(self.client.separate_budgets),
+                        }
+                        response = self.streamed_response(
+                            self.client, attempt_payload, timeout, run_budget,
+                        )
+                    else:
+                        response = self.client.complete(payload, timeout)
                     record["status"] = 200
+                    record["budget_usage"] = response.get("budget_usage")
                 except TransportError as caught:
                     error = caught
                     record["status"] = caught.status
                 finally:
                     record["ended_at"] = utc()
                     record["model_seconds"] = self.clock() - started
+                    record["reasoning_budget_used"] = run_budget.reasoning_used - reasoning_before
                     with self.lock:
                         self.attempts.append(record)
                 if self.clock() > deadline:
@@ -417,6 +565,8 @@ def run_agent(
     ]
     records: list[JSON] = []
     tool_records: list[JSON] = []
+    run_budget = RunBudget(budgets)
+    streaming = isinstance(executor.client, StreamingClient)
     started = executor.clock()
     outcome: Document = {
         "status": "failed", "failure": "turn_limit", "final": None,
@@ -424,7 +574,9 @@ def run_agent(
             "reasoning_tokens": budgets.reasoning_tokens,
             "final_tokens": budgets.final_tokens,
             "independent_caps_supported": executor.client.separate_budgets,
-            "mode": "independent" if executor.client.separate_budgets else "shared_total_low_effort",
+            "mode": "stream_enforced" if streaming else "independent",
+            "counting": "utf8_byte_upper_bound" if streaming else "provider_usage",
+            "stream_caps_enforced": streaming,
         },
     }
     for turn in range(1, max_turns + 1):
@@ -438,9 +590,10 @@ def run_agent(
         try:
             payload: Document = {
                 "model": "k-exaone_v2.5", "messages": list(messages), "tools": list(TOOLS),
-                **budgets.parameters(executor.client.separate_budgets),
+                **run_budget.remaining.parameters(executor.client.separate_budgets),
             }
-            response = executor.request(payload, request_id)
+            response = executor.request(payload, request_id, budget=run_budget)
+            record["budget_usage"] = response.get("budget_usage")
             # Preserve the raw response facts even when the message is malformed.
             choices = response.get("choices")
             if isinstance(choices, list) and choices:
@@ -456,6 +609,12 @@ def run_agent(
                 finish_reason=reply.finish_reason, usage=reply.usage,
                 role=reply.message["role"], has_tools=bool(reply.calls),
             )
+            if not streaming:
+                details = mapping(reply.usage.get("completion_tokens_details") or {})
+                used = details.get("reasoning_tokens") or 0
+                if not isinstance(used, int) or used < 0:
+                    raise ProtocolError("reasoning usage must be nonnegative integer")
+                run_budget.reasoning_used += used
         except RequestFailed as error:
             record["failure"] = outcome["failure"] = error.reason
             break
@@ -504,6 +663,7 @@ def run_agent(
         mapping(records[-1])["failure"] = "turn_limit"
     request_ids = {mapping(record)["request_id"] for record in records}
     attempts = [a for a in executor.attempts if a["request_id"] in request_ids]
+    mapping(outcome["budget"])["reasoning_used"] = run_budget.reasoning_used
     model_seconds = sum(float(a["model_seconds"]) for a in attempts)
     tool_seconds = sum(float(mapping(t)["tool_seconds"]) for t in tool_records)
     outcome.update(

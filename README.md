@@ -38,11 +38,22 @@ python3 agent.py --task task.txt --workdir ./my-task \
    턴 제한은 실패이며 `final`은 null이다. 잘린 도구 호출은 실행하지 않는다.
    최종 답은 도구 없는 정상 assistant `stop` 응답에서만 나온다.
    `<think>` 또는 `</think>`가 최종 본문에 섞여도 실패 처리한다.
-2. 지원 클라이언트는 `--reasoning-budget`과 `--final-budget`을 독립 필드로 받는다.
-   EXAONE은 입력 하네스에서 독립 추론 상한의 지원이 확인되지 않았다.
-   지원하지 않는 필드를 임의로 보내지 않고 총량은 두 예산의 합, effort는 low로 요청한다.
-   보고서의 `independent_caps_supported=false`가 이 한계를 명시한다.
-   실제 EXAONE 독립 상한 지원 여부와 effort 동작 확인은 후속 실실행 과제다.
+2. EXAONE 응답은 SSE 스트림으로 받으며 실행기가 두 예산을 독립적으로 검사한다.
+   `reasoning_content`가 실행 전체의 `--reasoning-budget`을 초과하면 즉시 HTTP를 닫고
+   `reasoning_budget_exceeded` 실패를 기록한다. `content`가 요청별 `--final-budget`을
+   초과하면 `final_budget_exceeded` 실패다. 두 경우 모두 final은 null이고 도구도 실행하지 않는다.
+   provider tokenizer가 없어 UTF-8 바이트 하나를 예산 단위 하나로 보수적으로 센다.
+   따라서 한글·다중 바이트 문자 등은 실제 tokenizer보다 일찍 중단될 수 있다.
+   보고서의 `counting=utf8_byte_upper_bound`와 `budget_usage`가 실제 과금 usage와 이를 구분한다.
+   스트림 델타 단위로 검사하므로 초과를 드러낸 델타는 수신되지만 답이나 도구에 반영하지 않는다.
+   추론 소비는 턴 및 부분 스트림 전송 재시도 전체에 누적되며 환급되지 않는다.
+   예산을 정확히 소진한 뒤 다음 요청은 `enable_thinking=false`, `max_tokens=final_tokens`다.
+   제공자가 thinking을 무시해 다시 추론을 보내면 즉시 같은 실패로 중단한다.
+   아직 추론 여유가 있으면 서버 max_tokens는 잔여 추론과 답변 예산의 합이지만,
+   로컬 스트림 검사가 각각의 상한을 강제한다. 도구 호출 델타는 조립 후 정상 완료일 때만 실행한다.
+   `independent_caps_supported=false`는 서버 독립 필드 미지원이고,
+   `stream_caps_enforced=true`는 실행기 강제가 활성화되었다는 뜻이다.
+   독립 필드를 지원하는 비스트리밍 클라이언트도 기존 인터페이스로 사용할 수 있다.
 3. 전송 재시도는 모델 대화 밖에서 처리한다. 요청/시도 ID·시각·상태·대기를 따로 기록한다.
    429·5xx·네트워크 오류만 재시도하고 숫자/HTTP 날짜 `Retry-After`를 지킨다.
    전체 시간 예산을 넘는 대기는 시작하지 않는다. 개별 timeout도 잔여 예산 이내다.
@@ -68,6 +79,8 @@ python3 agent.py --task task.txt --workdir ./my-task \
 
 ## 현재 검증 범위
 
-실제 EXAONE API는 호출하지 않았다. 종료 판정, 예산 분리, 429/503 재시도와 시간 예산,
+실제 EXAONE API는 호출하지 않았다. 실제 ExaClient의 HTTP를 SSE 재생으로 대체해
+초과 시 조기 연결 종료를 검증한다. 스트리밍 추론/답변 초과, 턴 간 누적 및 thinking 해제,
+부분 스트림 재시도 후 소비 보존, 종료 판정, 429/503 재시도와 시간 예산,
 동시 호출 제한, 시간 분리, 실제 sandbox 탈출 거부, 중복 차단을 스텁으로 검사한다.
 실행 중인 벤치가 끝난 뒤 실제 제공자 호환성과 품질을 확인해야 한다.

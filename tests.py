@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import io
 import subprocess
 import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
+from unittest.mock import patch
 
 from agent import (
-    Budgets, Document, Executor, JSON, ReplayClient, RequestFailed, RetryPolicy,
+    Budgets, Document, ExaClient, Executor, JSON, ReplayClient, RequestFailed, RetryPolicy,
     Sandbox, TransportError, mapping, run_agent,
 )
 
@@ -115,6 +118,208 @@ def independent_budgets() -> None:
     shared = Budgets(5, 12).parameters(False)
     assert shared["max_tokens"] == 17
     assert "reasoning_max_tokens" not in shared
+    exhausted = Budgets(0, 12).parameters(False)
+    assert exhausted["max_tokens"] == 12
+    assert exhausted["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def delta(content: Document, finish: str | None = None) -> Document:
+    return {"choices": [{"index": 0, "delta": content, "finish_reason": finish}]}
+
+
+class StreamingReplayClient:
+    """Lazy stream replay with closure/consumption evidence and no network."""
+
+    separate_budgets = False
+
+    def __init__(self, scripts: list[list[Document]]):
+        self.scripts = iter(scripts)
+        self.payloads: list[Document] = []
+        self.consumed: list[int] = []
+        self.closed = 0
+
+    @contextmanager
+    def stream(self, payload: Document, timeout: float) -> Iterator[Iterator[Document]]:
+        assert timeout > 0
+        self.payloads.append(payload)
+        self.consumed.append(0)
+        try:
+            script = next(self.scripts)
+        except StopIteration:
+            raise AssertionError("unexpected model request after replay exhausted") from None
+
+        def events() -> Iterator[Document]:
+            for event in script:
+                self.consumed[-1] += 1
+                if "error" in event:
+                    error = mapping(event["error"])
+                    raise TransportError(error["status"], str(error["retry_after"]))
+                yield event
+
+        try:
+            yield events()
+        finally:
+            self.closed += 1
+
+
+def streaming_reasoning_budget() -> None:
+    """Crossing reasoning cap closes early, never executes pending calls or retries."""
+    pending = call("write_file", {"path": "bad", "content": "must not run"})
+    client = StreamingReplayClient([[
+        delta({"reasoning_content": "x"}),
+        delta({"tool_calls": [{**pending, "index": 0}]}),
+        delta({"reasoning_content": "yz"}),
+        delta({"content": "this must not be consumed"}, "stop"),
+    ]])
+    with tempfile.TemporaryDirectory() as directory:
+        result = run_agent("task", Sandbox(Path(directory)), Executor(client),
+                           GUIDE, budgets=Budgets(2, 64))
+        assert not Path(directory, "bad").exists()
+    assert result["failure"] == "reasoning_budget_exceeded"
+    assert result["final"] is None
+    assert result["requests"][0]["finish_reason"] == "reasoning_budget_exceeded"
+    assert result["requests"][0]["budget_usage"]["reasoning"] == 3
+    assert len(result["transport_attempts"]) == 1
+    assert result["tools"] == []
+    assert client.consumed == [3]
+    assert client.closed == 1
+
+
+def streaming_answer_budget() -> None:
+    """Reasoning allowance cannot subsidize an oversized streamed answer."""
+    client = StreamingReplayClient([[
+        delta({"reasoning_content": "abcd"}),
+        delta({"content": "가"}),
+        delta({"content": "a"}),
+        delta({"content": "ignored"}, "stop"),
+    ]])
+    with tempfile.TemporaryDirectory() as directory:
+        result = run_agent("task", Sandbox(Path(directory)), Executor(client),
+                           GUIDE, budgets=Budgets(4, 3))
+    assert result["failure"] == "final_budget_exceeded"
+    assert result["final"] is None
+    assert result["requests"][0]["finish_reason"] == "final_budget_exceeded"
+    assert result["requests"][0]["budget_usage"]["answer"] == 4
+    assert result["requests"][0]["budget_usage"]["reasoning"] == 4
+    assert client.consumed == [3]
+    assert client.closed == 1
+
+
+def streaming_cumulative_budget() -> None:
+    """Exact exhaustion across tool turns disables thinking on the next request."""
+    first = call("write_file", {"path": "x", "content": "first"})
+    client = StreamingReplayClient([
+        [
+            delta({"reasoning_content": "a"}),
+            delta({"tool_calls": [{**first, "index": 0}]}, "tool_calls"),
+        ],
+        [
+            delta({"reasoning_content": "bc"}),
+            delta({"tool_calls": [{
+                "index": 0, "id": "c2", "type": "function",
+                "function": {"name": "write_file", "arguments": '{"path":'},
+            }]}),
+            delta({"tool_calls": [{
+                "index": 0, "function": {"arguments": '"x", "content":"second"}'},
+            }]}, "tool_calls"),
+        ],
+        [delta({"content": "done"}, "stop")],
+    ])
+    with tempfile.TemporaryDirectory() as directory:
+        result = run_agent("task", Sandbox(Path(directory)), Executor(client),
+                           GUIDE, budgets=Budgets(3, 128))
+        assert Path(directory, "x").read_text() == "second"
+    assert result["status"] == "succeeded"
+    assert result["final"] == "done"
+    assert result["budget"]["mode"] == "stream_enforced"
+    assert result["budget"]["reasoning_used"] == 3
+    assert [p["chat_template_kwargs"]["enable_thinking"] for p in client.payloads] == [True, True, False]
+    assert [p["max_tokens"] for p in client.payloads] == [131, 130, 128]
+    assert [r["budget_usage"]["reasoning_total"] for r in result["requests"]] == [1, 3, 3]
+    assert client.closed == 3
+
+
+def streaming_retry_keeps_reasoning_charge() -> None:
+    """Partial streams cannot replenish the run's reasoning budget on retry."""
+    first = call("list_dir", {"path": "."})
+    client = StreamingReplayClient([
+        [delta({"reasoning_content": "ab"}), {"error": {"status": 429, "retry_after": "0"}}],
+        [
+            delta({"reasoning_content": "c"}),
+            delta({"tool_calls": [{**first, "index": 0}]}, "tool_calls"),
+        ],
+        [delta({"content": "done"}, "stop")],
+    ])
+    clock = Clock()
+    with tempfile.TemporaryDirectory() as directory:
+        result = run_agent("task", Sandbox(Path(directory)), Executor(
+            client, clock=clock.read, sleep=clock.advance,
+        ), GUIDE, budgets=Budgets(3, 128))
+    assert result["status"] == "succeeded"
+    assert result["budget"]["reasoning_used"] == 3
+    assert [a["status"] for a in result["transport_attempts"]] == [429, 200, 200]
+    assert [a["reasoning_budget_used"] for a in result["transport_attempts"]] == [2, 1, 0]
+    assert [p["max_tokens"] for p in client.payloads] == [131, 129, 128]
+    assert client.payloads[-1]["chat_template_kwargs"]["enable_thinking"] is False
+    assert len(result["requests"]) == 2
+    assert client.closed == 3
+
+
+def exa_streaming_wire_budget() -> None:
+    """The real ExaClient uses SSE and closes HTTP before reading over-budget tail."""
+    events = [
+        delta({"role": "assistant", "reasoning_content": "x"}),
+        delta({"reasoning_content": "yz"}),
+        delta({"content": "never read"}, "stop"),
+    ]
+    wire = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+    wire += b"data: [DONE]\n\n"
+
+    class HTTPReplay(io.BytesIO):
+        stopped_at = 0
+
+        def close(self) -> None:
+            if not self.closed:
+                self.stopped_at = self.tell()
+            super().close()
+
+    http = HTTPReplay(wire)
+    with tempfile.TemporaryDirectory() as directory:
+        with patch("agent.urllib.request.urlopen", return_value=http) as open_http:
+            result = run_agent("task", Sandbox(Path(directory)), Executor(ExaClient("offline")),
+                               GUIDE, budgets=Budgets(2, 64))
+        body = json.loads(open_http.call_args.args[0].data)
+    assert body["stream"] is True
+    assert body["stream_options"]["include_usage"] is True
+    assert "reasoning_max_tokens" not in body
+    assert result["failure"] == "reasoning_budget_exceeded"
+    assert result["final"] is None
+    assert http.closed
+    assert http.stopped_at < len(wire)
+
+
+def exa_streaming_wire_completion() -> None:
+    """Real SSE parsing preserves usage arriving after the terminal delta."""
+    events = [
+        delta({"role": "assistant", "reasoning_content": "ab"}),
+        delta({"content": "do"}),
+        delta({"content": "ne"}, "stop"),
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 6}},
+    ]
+    wire = b": heartbeat\n\n" + b"".join(
+        b"data: " + json.dumps(event).encode() + b"\n\n" for event in events
+    ) + b"data: [DONE]\n\n"
+    http = io.BytesIO(wire)
+    with tempfile.TemporaryDirectory() as directory:
+        with patch("agent.urllib.request.urlopen", return_value=http):
+            result = run_agent("task", Sandbox(Path(directory)), Executor(ExaClient("offline")),
+                               GUIDE, budgets=Budgets(2, 4))
+    assert result["status"] == "succeeded"
+    assert result["final"] == "done"
+    assert result["requests"][0]["usage"] == {"prompt_tokens": 9, "completion_tokens": 6}
+    assert result["requests"][0]["budget_usage"]["answer"] == 4
+    assert result["budget"]["reasoning_used"] == 2
+    assert http.closed
 
 
 def transport_retries() -> None:
@@ -365,7 +570,10 @@ def cli_end_to_end() -> None:
 
 def main() -> None:
     tests: list[Callable[[], None]] = [
-        termination, independent_budgets, transport_retries, retry_budget_and_status,
+        termination, independent_budgets, streaming_reasoning_budget, streaming_answer_budget,
+        streaming_cumulative_budget, streaming_retry_keeps_reasoning_charge,
+        exa_streaming_wire_budget, exa_streaming_wire_completion,
+        transport_retries, retry_budget_and_status,
         concurrency_limit, separate_times, sandbox_boundary, duplicate_guard,
         cli_end_to_end,
     ]
