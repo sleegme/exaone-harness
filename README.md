@@ -60,7 +60,10 @@ python3 agent.py --task task.txt --workdir ./my-task \
    SSE 파싱 전에 모든 원시 줄(heartbeat·주석·빈 줄 포함)의 읽기 전후에
    같은 절대 마감 시간을 검사하고, 소켓 읽기 timeout을 매번 잔여 시간으로 줄인다.
    요청을 열기 전에 타이머를 시작하고 urllib 연결 생성 단계에서 소켓을 등록한다.
-   연결·헤더·본문은 같은 절대 마감을 쓰며 주소 재시도나 응답 수신 후에도 재설정하지 않는다.
+   DNS는 daemon 스레드에서 해석하고 호출자는 큐 결과를 남은 시간만 기다린다.
+   마감이 지나면 OS resolver의 종료를 기다리지 않고 `transport_timeout`으로 반환한다.
+   늦은 결과는 큐에만 저장되며 소켓을 생성하거나 연결하지 않는다.
+   DNS·연결·헤더·본문은 같은 절대 마감을 쓰며 주소 재시도나 응답 수신 후에도 재설정하지 않는다.
    마감 타이머가 등록된 소켓을 shutdown/close하므로 느린 헤더나 줄바꿈 없는 본문도 중단한다.
    실제 연결은 프록시 환경변수를 사용하지 않는 전용 HTTPS opener로 수행한다.
    무응답·마감 초과는 전송 기록의 `error=transport_timeout`으로 남기고
@@ -93,4 +96,6 @@ python3 agent.py --task task.txt --workdir ./my-task \
 동시 호출 제한, 시간 분리, 실제 sandbox 탈출 거부, 중복 차단을 스텁으로 검사한다.
 느린 헤더·무응답·부분 본문·heartbeat는 localhost 서버와 실제 urllib/socket으로도 검사한다.
 이 로컬 검사는 TLS만 우회하며 외부 DNS나 EXAONE에 접속하지 않는다.
+별도 주입형 검사는 DNS가 계속 막힌 상태에서도 deadline에 반환하는 것과
+늦은 해석 결과의 연결 차단, DNS 오류의 전송 오류 분류를 확인한다.
 실행 중인 벤치가 끝난 뒤 실제 제공자 호환성과 품질을 확인해야 한다.

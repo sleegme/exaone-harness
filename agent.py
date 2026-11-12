@@ -8,6 +8,7 @@ import hashlib
 import http.client
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -30,6 +31,8 @@ from typing import Callable, ContextManager, Iterable, Iterator, Protocol, TypeA
 
 JSON: TypeAlias = str | int | float | bool | None | list["JSON"] | dict[str, "JSON"]
 Document: TypeAlias = dict[str, JSON]
+SocketAddress: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
+AddressInfo: TypeAlias = tuple[int, int, int, str, SocketAddress]
 PROTECTED = (Path("/tmp/exa-harness"), Path("/tmp/exa-bench"))
 IGNORED_STATE = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache"})
 
@@ -231,6 +234,31 @@ class RequestDeadline:
             raise TransportTimeout()
         active.settimeout(self.remaining())
 
+    def resolve(self, address: tuple[str, int]) -> list[AddressInfo]:
+        """Bound the caller's wait even when the OS resolver cannot be cancelled."""
+        self.remaining()
+        results: queue.SimpleQueue[list[AddressInfo] | OSError] = queue.SimpleQueue()
+        resolver = socket.getaddrinfo
+
+        def lookup() -> None:
+            # This worker owns only lookup and its result queue, never a socket.
+            try:
+                addresses = resolver(*address, type=socket.SOCK_STREAM)
+            except OSError as error:
+                results.put(error)
+            else:
+                results.put(addresses)
+
+        threading.Thread(target=lookup, name="exa-dns", daemon=True).start()
+        try:
+            result = results.get(timeout=self.remaining())
+        except queue.Empty:
+            raise TransportTimeout() from None
+        self.remaining()  # A result arriving at/after expiry is never connected.
+        if isinstance(result, OSError):
+            raise result
+        return result
+
     def create_connection(
         self, address: tuple[str, int], timeout: float,
         source_address: tuple[str, int] | None = None,
@@ -239,9 +267,7 @@ class RequestDeadline:
         del timeout  # The absolute deadline owns every address attempt's timeout.
         self.remaining()
         failure: OSError | None = None
-        for family, kind, proto, _, target in socket.getaddrinfo(
-            *address, type=socket.SOCK_STREAM,
-        ):
+        for family, kind, proto, _, target in self.resolve(address):
             active = socket.socket(family, kind, proto)
             try:
                 self.attach(active)

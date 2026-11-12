@@ -608,6 +608,65 @@ def localhost_request_deadline() -> None:
                 assert len(result["transport_attempts"]) == 1
 
 
+def slow_resolver_deadline() -> None:
+    """The real adapter returns at its deadline while DNS remains blocked."""
+    release, entered, finished = threading.Event(), threading.Event(), threading.Event()
+    resolver_threads: list[threading.Thread] = []
+
+    def resolve(host, port, *args, **kwargs):
+        del args, kwargs
+        assert host == "api.exaone.ai" and port == 443
+        resolver_threads.append(threading.current_thread())
+        entered.set()
+        try:
+            # Model an uninterruptible OS resolver, with a finite test safety cap.
+            release.wait(0.6)
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 9))]
+        finally:
+            finished.set()
+
+    with tempfile.TemporaryDirectory() as directory:
+        with patch("agent.socket.getaddrinfo", side_effect=resolve):
+            with patch("agent.socket.socket", side_effect=OSError("unexpected connect")) as sockets:
+                try:
+                    started = time.monotonic()
+                    result = run_agent("task", Sandbox(Path(directory)), Executor(
+                        ExaClient("offline"), RetryPolicy(0.15, 0.15, max_attempts=1),
+                    ), GUIDE)
+                    elapsed = time.monotonic() - started
+                    resolver_still_blocked = not finished.is_set()
+                finally:
+                    release.set()
+                    for worker in resolver_threads:
+                        if worker is not threading.current_thread():
+                            worker.join(timeout=2)
+                            assert not worker.is_alive()
+                created_socket_count = sockets.call_count
+    assert entered.is_set()
+    assert elapsed < 0.4, elapsed
+    assert created_socket_count == 0, "late DNS result attempted a connection"
+    assert resolver_still_blocked
+    assert finished.is_set()
+    assert resolver_threads[0].daemon
+    assert result["failure"] == "retry_time_budget"
+    assert result["final"] is None
+    assert len(result["transport_attempts"]) == 1
+    assert result["transport_attempts"][0]["error"] == "transport_timeout"
+    assert result["model_seconds"] < 0.4
+
+
+def resolver_error_remains_transport_error() -> None:
+    """DNS errors crossing the worker boundary retain ordinary transport retries."""
+    with tempfile.TemporaryDirectory() as directory:
+        with patch("agent.socket.getaddrinfo", side_effect=socket.gaierror("offline resolver error")):
+            result = run_agent("task", Sandbox(Path(directory)), Executor(
+                ExaClient("offline"), RetryPolicy(2, 2, max_attempts=1),
+            ), GUIDE)
+    assert result["failure"] == "transport_exhausted"
+    assert result["final"] is None
+    assert result["transport_attempts"][0]["error"] == "transport_error"
+
+
 def transport_retries() -> None:
     """429s replay the same logical request and remain outside model transcript."""
     clock = Clock()
@@ -862,6 +921,7 @@ def main() -> None:
         raw_stream_deadline, silent_stream_remaining_timeout, stream_timeouts_share_retry_budget,
         watchdog_interrupts_partial_line,
         localhost_request_deadline,
+        slow_resolver_deadline, resolver_error_remains_transport_error,
         transport_retries, retry_budget_and_status,
         concurrency_limit, separate_times, sandbox_boundary, duplicate_guard,
         cli_end_to_end,
