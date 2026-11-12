@@ -4,7 +4,9 @@
 Import as ``harbor_agent:ExaHarnessAgent`` with this file's directory on
 ``PYTHONPATH``. The adapter uploads ``agent.py``/``guide.txt`` into the task
 container and runs ``python3 agent.py --model exa --no-bwrap`` there (the
-container already provides what bubblewrap provides on a host).
+container already provides what bubblewrap provides on a host; the reasoning
+budget is raised to 258048 so long multi-turn runs are bounded by the task
+timeout instead of the tiny standalone default).
 ``EXAONE_API_KEY`` is read from the harbor process environment and passed only
 to the container exec call, never to job configs, logs, or files.
 """
@@ -71,6 +73,7 @@ class ExaHarnessAgent(BaseInstalledAgent):
             f" --task {REMOTE_DIR}/task.txt"
             ' --workdir "$(pwd)"'
             " --model exa --no-bwrap"
+            " --reasoning-budget 258048"
             f" --output {REMOTE_DIR}/result.json"
         )
         await self._exec(environment, command, env={"EXAONE_API_KEY": key})
