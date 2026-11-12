@@ -895,7 +895,7 @@ def main() -> int:
     parser.add_argument("--max-turns", type=int, default=25)
     parser.add_argument("--reasoning-budget", type=int, default=4096)
     parser.add_argument("--final-budget", type=int, default=4096)
-    parser.add_argument("--retry-budget", type=float, default=120)
+    parser.add_argument("--retry-budget", type=float, default=300)
     parser.add_argument("--request-timeout", type=float, default=60)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--output", type=Path, help="JSON report outside the task folder")
@@ -916,6 +916,8 @@ def main() -> int:
             if not key:
                 parser.error("EXAONE_API_KEY is required for --model exa")
             client = ExaClient(key)
+    if args.no_bwrap and not (Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()):
+        parser.error("--no-bwrap is only allowed inside a container")
     sandbox = Sandbox(args.workdir, isolate=not args.no_bwrap)
     output = args.output or Path(__file__).parent / "logs" / f"{uuid.uuid4().hex}.json"
     output = output.resolve()
