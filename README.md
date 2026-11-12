@@ -57,6 +57,11 @@ python3 agent.py --task task.txt --workdir ./my-task \
 3. 전송 재시도는 모델 대화 밖에서 처리한다. 요청/시도 ID·시각·상태·대기를 따로 기록한다.
    429·5xx·네트워크 오류만 재시도하고 숫자/HTTP 날짜 `Retry-After`를 지킨다.
    전체 시간 예산을 넘는 대기는 시작하지 않는다. 개별 timeout도 잔여 예산 이내다.
+   SSE 파싱 전에 모든 원시 줄(heartbeat·주석·빈 줄 포함)의 읽기 전후에
+   같은 절대 마감 시간을 검사하고, 소켓 읽기 timeout을 매번 잔여 시간으로 줄인다.
+   별도 마감 타이머가 소켓을 shutdown하므로 줄바꿈 없이 바이트가 계속 들어와도 중단한다.
+   무응답·마감 초과는 전송 기록의 `error=transport_timeout`으로 남기고
+   사용한 시간과 재시도 대기를 동일한 전체 예산에서 차감한다.
    `--retry-budget`(기본 120초), `--request-timeout`(60초), 최대 6회,
    `--concurrency`(1)의 공유 semaphore를 적용한다. 한 CLI의 모델 호출과 도구는 순차다.
    동시성 제한은 같은 executor를 공유하는 호출에 적용되며 여러 CLI 프로세스 사이 전역 제한은 아니다.

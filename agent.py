@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -40,7 +41,16 @@ class TransportError(RuntimeError):
     def __init__(self, status: int | None, retry_after: str | None = None):
         self.status = status
         self.retry_after = retry_after
+        self.kind = "transport_error"
         super().__init__(f"transport status={status}")
+
+
+class TransportTimeout(TransportError):
+    """A socket read or absolute attempt deadline expired."""
+
+    def __init__(self) -> None:
+        super().__init__(None)
+        self.kind = "transport_timeout"
 
 
 class RequestFailed(RuntimeError):
@@ -126,10 +136,35 @@ class CompletionClient(Protocol):
 class StreamingClient(Protocol):
     separate_budgets: bool
 
-    def stream(self, payload: Document, timeout: float) -> ContextManager[Iterator[Document]]: ...
+    def stream(
+        self, payload: Document, timeout: float, *,
+        deadline: float, clock: Callable[[], float],
+    ) -> ContextManager[Iterator[Document]]: ...
 
 
 Client: TypeAlias = CompletionClient | StreamingClient
+
+
+def deadline_lines(
+    lines: Iterable[bytes], set_read_timeout: Callable[[float], None], *,
+    deadline: float, clock: Callable[[], float],
+) -> Iterator[bytes]:
+    """Bound every raw read, including lines that the SSE parser discards."""
+    iterator = iter(lines)
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise TransportTimeout()
+        set_read_timeout(remaining)
+        try:
+            raw = next(iterator)
+        except StopIteration:
+            if clock() >= deadline:
+                raise TransportTimeout() from None
+            return
+        if clock() >= deadline:
+            raise TransportTimeout()
+        yield raw
 
 
 def sse_events(lines: Iterable[bytes]) -> Iterator[Document]:
@@ -159,7 +194,10 @@ class ExaClient:
         self.key = key
 
     @contextmanager
-    def stream(self, payload: Document, timeout: float) -> Iterator[Iterator[Document]]:
+    def stream(
+        self, payload: Document, timeout: float, *,
+        deadline: float, clock: Callable[[], float],
+    ) -> Iterator[Iterator[Document]]:
         request = urllib.request.Request(
             "https://api.exaone.ai/v1/chat/completions",
             data=json.dumps({
@@ -170,15 +208,54 @@ class ExaClient:
                 "Accept": "text/event-stream",
             },
         )
+        expired = threading.Event()
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                yield sse_events(response)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise TransportTimeout()
+            with urllib.request.urlopen(request, timeout=min(timeout, remaining)) as response:
+                # urllib's HTTPResponse.fp is BufferedReader(SocketIO(socket)).
+                # Keep this stdlib-specific socket access inside the wire adapter.
+                transport_socket = response.fp.raw._sock
+
+                def expire() -> None:
+                    expired.set()
+                    try:
+                        transport_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        # The response may have closed concurrently at the deadline.
+                        pass
+
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise TransportTimeout()
+                # settimeout bounds silent reads. This watchdog also bounds a
+                # readline kept alive by bytes arriving without a newline.
+                timer = threading.Timer(remaining, expire)
+                timer.daemon = True
+                timer.start()
+                try:
+                    yield sse_events(deadline_lines(
+                        response, transport_socket.settimeout,
+                        deadline=deadline, clock=clock,
+                    ))
+                finally:
+                    timer.cancel()
+                    timer.join()
         except urllib.error.HTTPError as error:
             retry_after = error.headers.get("Retry-After")
             status = error.code
             error.close()
             raise TransportError(status, retry_after) from None
-        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+        except TimeoutError:
+            raise TransportTimeout() from None
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise TransportTimeout() from None
+            raise TransportError(None) from None
+        except (OSError, http.client.HTTPException):
+            if expired.is_set() or clock() >= deadline:
+                raise TransportTimeout() from None
             raise TransportError(None) from None
 
 
@@ -239,6 +316,7 @@ class Executor:
 
     def streamed_response(
         self, client: StreamingClient, payload: Document, timeout: float, budget: RunBudget,
+        *, deadline: float,
     ) -> Document:
         """Accumulate deltas only while both independent budgets permit them."""
         message: Document = {"role": "assistant", "content": "", "reasoning_content": ""}
@@ -247,11 +325,10 @@ class Executor:
         finish = "stream_incomplete"
         reasoning_start = budget.reasoning_used
         answer_used = 0
-        deadline = self.clock() + timeout
-        with client.stream(payload, timeout) as events:
+        with client.stream(payload, timeout, deadline=deadline, clock=self.clock) as events:
             for event in events:
                 if self.clock() >= deadline:
-                    raise TransportError(None)
+                    raise TransportTimeout()
                 if event.get("usage") is not None:
                     usage = mapping(event["usage"])
                 choices = event.get("choices") or []
@@ -345,6 +422,7 @@ class Executor:
                         }
                         response = self.streamed_response(
                             self.client, attempt_payload, timeout, run_budget,
+                            deadline=min(deadline, started + self.policy.timeout_seconds),
                         )
                     else:
                         response = self.client.complete(payload, timeout)
@@ -353,13 +431,14 @@ class Executor:
                 except TransportError as caught:
                     error = caught
                     record["status"] = caught.status
+                    record["error"] = caught.kind
                 finally:
                     record["ended_at"] = utc()
                     record["model_seconds"] = self.clock() - started
                     record["reasoning_budget_used"] = run_budget.reasoning_used - reasoning_before
                     with self.lock:
                         self.attempts.append(record)
-                if self.clock() > deadline:
+                if self.clock() >= deadline:
                     raise RequestFailed(request_id, "retry_time_budget")
                 if response is not None:
                     return response
