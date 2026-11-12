@@ -69,7 +69,7 @@ python3 agent.py --task task.txt --workdir ./my-task \
    실제 연결은 프록시 환경변수를 사용하지 않는 전용 HTTPS opener로 수행한다.
    무응답·마감 초과는 전송 기록의 `error=transport_timeout`으로 남기고
    사용한 시간과 재시도 대기를 동일한 전체 예산에서 차감한다.
-   `--retry-budget`(기본 120초), `--request-timeout`(60초), 최대 6회,
+   `--retry-budget`(기본 300초), `--request-timeout`(60초), 최대 10회,
    `--concurrency`(1)의 공유 semaphore를 적용한다. 한 CLI의 모델 호출과 도구는 순차다.
    동시성 제한은 같은 executor를 공유하는 호출에 적용되며 여러 CLI 프로세스 사이 전역 제한은 아니다.
 4. 실제 전송 시도 합계 `model_seconds`, 도구 합계 `tool_seconds`,

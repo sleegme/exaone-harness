@@ -732,6 +732,20 @@ def retry_budget_and_status() -> None:
     assert len(executor.attempts) == 2
 
 
+def retry_storm_recovers() -> None:
+    """A 429 storm inside the default five-minute retry budget recovers."""
+    assert RetryPolicy().budget_seconds == 300
+    assert RetryPolicy().max_attempts == 10
+    clock = Clock()
+    client = ReplayClient([{"error": {"status": 429, "retry_after": "1"}}] * 9 + [reply()])
+    executor = Executor(client, RetryPolicy(), clock=clock.read, sleep=clock.advance)
+    with tempfile.TemporaryDirectory() as directory:
+        result = run_agent("task", Sandbox(Path(directory)), executor, GUIDE)
+    assert result["status"] == "succeeded"
+    assert [a["status"] for a in result["transport_attempts"]] == [429] * 9 + [200]
+    assert result["retry_wait_seconds"] == 9
+
+
 def concurrency_limit() -> None:
     """Real threads sharing the executor cannot enter the client concurrently."""
     entered, release = threading.Event(), threading.Event()
@@ -938,7 +952,7 @@ def main() -> None:
         watchdog_interrupts_partial_line,
         localhost_request_deadline,
         slow_resolver_deadline, resolver_error_remains_transport_error,
-        transport_retries, retry_budget_and_status,
+        transport_retries, retry_budget_and_status, retry_storm_recovers,
         concurrency_limit, separate_times, sandbox_boundary, duplicate_guard,
         no_bwrap_shell, cli_end_to_end,
     ]

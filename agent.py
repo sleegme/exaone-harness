@@ -404,9 +404,9 @@ class ReplayClient:
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    budget_seconds: float = 120
+    budget_seconds: float = 300
     timeout_seconds: float = 60
-    max_attempts: int = 6
+    max_attempts: int = 10
     concurrency: int = 1
 
     def __post_init__(self) -> None:
