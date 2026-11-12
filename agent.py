@@ -619,14 +619,15 @@ TOOLS = [
 class Sandbox:
     """No host root mount: only runtimes read-only and task files read/write."""
 
-    def __init__(self, workdir: Path):
+    def __init__(self, workdir: Path, isolate: bool = True):
         self.root = workdir.resolve(strict=True)
         if not self.root.is_dir():
             raise ProtocolError("workdir must be a directory")
         for protected in PROTECTED:
             if self.root.is_relative_to(protected) or protected.is_relative_to(self.root):
                 raise PermissionError("workdir overlaps a protected benchmark directory")
-        if not shutil.which("bwrap"):
+        self.isolate = isolate
+        if self.isolate and not shutil.which("bwrap"):
             raise ProtocolError("bubblewrap is required; shell isolation cannot be disabled")
         self.checks: dict[str, str] = {}
 
@@ -662,22 +663,33 @@ class Sandbox:
         fingerprint = hashlib.sha256((command + "\0" + self.state()).encode()).hexdigest()
         if fingerprint in self.checks:
             return "UNCHANGED: identical check blocked; previous result: " + self.checks[fingerprint]
-        argv = [
-            "bwrap", "--unshare-all", "--die-with-parent", "--new-session",
-            "--cap-drop", "ALL", "--ro-bind", "/usr", "/usr",
-            "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
-            "--symlink", "usr/lib", "/lib64",
-            "--proc", "/proc", "--dev", "/dev",
-            "--tmpfs", "/tmp", "--remount-ro", "/tmp",
-            "--bind", str(self.root), "/work", "--chdir", "/work",
-            "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
-            "--setenv", "HOME", "/work", "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
-            "sh", "-c", command,
-        ]
+        if self.isolate:
+            argv = [
+                "bwrap", "--unshare-all", "--die-with-parent", "--new-session",
+                "--cap-drop", "ALL", "--ro-bind", "/usr", "/usr",
+                "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+                "--symlink", "usr/lib", "/lib64",
+                "--proc", "/proc", "--dev", "/dev",
+                "--tmpfs", "/tmp", "--remount-ro", "/tmp",
+                "--bind", str(self.root), "/work", "--chdir", "/work",
+                "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+                "--setenv", "HOME", "/work", "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+                "sh", "-c", command,
+            ]
+            run_env: dict[str, str] = {"PATH": "/usr/bin:/bin"}
+            run_cwd: str | None = None
+        else:
+            # The container already provides the isolation bwrap adds on the host.
+            argv = ["sh", "-c", command]
+            run_env = {
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(self.root),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            run_cwd = str(self.root)
         try:
             result = subprocess.run(
                 argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                timeout=60, env={"PATH": "/usr/bin:/bin"},
+                timeout=60, env=run_env, cwd=run_cwd,
             )
             summary = f"exit {result.returncode}\n{(result.stdout + result.stderr)[-8000:]}"
         except subprocess.TimeoutExpired:
@@ -887,6 +899,8 @@ def main() -> int:
     parser.add_argument("--request-timeout", type=float, default=60)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--output", type=Path, help="JSON report outside the task folder")
+    parser.add_argument("--no-bwrap", action="store_true",
+                        help="run shell tools without bubblewrap (already-isolated containers only)")
     args = parser.parse_args()
     client: Client
     match args.model:
@@ -902,7 +916,7 @@ def main() -> int:
             if not key:
                 parser.error("EXAONE_API_KEY is required for --model exa")
             client = ExaClient(key)
-    sandbox = Sandbox(args.workdir)
+    sandbox = Sandbox(args.workdir, isolate=not args.no_bwrap)
     output = args.output or Path(__file__).parent / "logs" / f"{uuid.uuid4().hex}.json"
     output = output.resolve()
     if output.is_relative_to(sandbox.root):

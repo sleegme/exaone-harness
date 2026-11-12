@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import http.client
 import socket
 import subprocess
@@ -865,6 +866,21 @@ def duplicate_guard() -> None:
         assert result["status"] == "succeeded"
 
 
+def no_bwrap_shell() -> None:
+    """Shell commands run directly inside the workdir when isolation is off."""
+    with tempfile.TemporaryDirectory() as directory:
+        work = Path(directory).resolve()
+        sandbox = Sandbox(work, isolate=False)
+        sandbox.execute("write_file", {"path": "in.txt", "content": "value"})
+        assert sandbox.shell("pwd && cat in.txt") == f"exit 0\n{work}\nvalue"
+        # The direct environment stays as cleared as the bwrap one.
+        os.environ["EXAONE_API_KEY"] = "host-secret"
+        try:
+            assert sandbox.shell('test -z "$EXAONE_API_KEY"') == "exit 0\n"
+        finally:
+            del os.environ["EXAONE_API_KEY"]
+
+
 def cli_end_to_end() -> None:
     """One CLI task reads, edits, executes a real test, blocks its replay, and finishes."""
     with tempfile.TemporaryDirectory() as directory:
@@ -924,7 +940,7 @@ def main() -> None:
         slow_resolver_deadline, resolver_error_remains_transport_error,
         transport_retries, retry_budget_and_status,
         concurrency_limit, separate_times, sandbox_boundary, duplicate_guard,
-        cli_end_to_end,
+        no_bwrap_shell, cli_end_to_end,
     ]
     for test in tests:
         test()

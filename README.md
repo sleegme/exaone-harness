@@ -1,6 +1,7 @@
 # EXAONE coding agent
 
 Python 3.10 이상과 Linux의 `bubblewrap`(`bwrap`)이 필요하다. Python 패키지 설치는 필요 없다.
+이미 격리된 컨테이너 안에서는 `--no-bwrap`로 bwrap 셸 격리를 건너뛰고 작업 폴더 안에서 직접 실행한다.
 기존 벤치 하네스에서 독립된 실행기이며, `guide.txt`는 `guide-weak-v3.txt`의 복사본이다.
 
 ## 실행
