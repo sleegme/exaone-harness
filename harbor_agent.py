@@ -73,7 +73,7 @@ class ExaHarnessAgent(BaseInstalledAgent):
             f" --task {REMOTE_DIR}/task.txt"
             ' --workdir "$(pwd)"'
             " --model exa --no-bwrap"
-            " --reasoning-budget 258048"
+            " --reasoning-budget 258048 --retry-budget 900"
             f" --output {REMOTE_DIR}/result.json"
         )
         await self._exec(environment, command, env={"EXAONE_API_KEY": key})
