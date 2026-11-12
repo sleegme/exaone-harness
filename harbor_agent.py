@@ -23,6 +23,8 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 REMOTE_DIR = "/logs/agent/exa-harness"
+REASONING_BUDGET = 258048
+RETRY_BUDGET_SEC = 900
 
 
 class ExaHarnessAgent(BaseInstalledAgent):
@@ -73,7 +75,7 @@ class ExaHarnessAgent(BaseInstalledAgent):
             f" --task {REMOTE_DIR}/task.txt"
             ' --workdir "$(pwd)"'
             " --model exa --no-bwrap"
-            " --reasoning-budget 258048 --retry-budget 900"
+            f" --reasoning-budget {REASONING_BUDGET} --retry-budget {RETRY_BUDGET_SEC}"
             f" --output {REMOTE_DIR}/result.json"
         )
         await self._exec(environment, command, env={"EXAONE_API_KEY": key})
